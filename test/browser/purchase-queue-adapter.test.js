@@ -128,6 +128,63 @@ test("non-OK listing and malformed stored data fail before any later phase", asy
   await assert.rejects(() => malformed.adapter.openListing(attempt), /stored_item_fields_invalid/);
 });
 
+test("adapter preserves only a safe underlying failure reason", async () => {
+  const { executor } = executorFixture({
+    async inspectListing() {
+      return {
+        ok: false,
+        status: "unknown",
+        reason: "listing_id_unverified",
+        body: "raw page body must never become a diagnostic",
+      };
+    },
+  });
+  const { adapter } = makeAdapter(executor);
+  await assert.rejects(
+    () => adapter.inspectListing(attempt),
+    (error) => {
+      assert.equal(error.code, "BROWSER_ADAPTER_INSPECT_LISTING_FAILED");
+      assert.equal(error.safeReason, "listing_id_unverified");
+      assert.equal(error.reason, "listing_id_unverified");
+      assert.doesNotMatch(error.message, /raw page body/);
+      return true;
+    },
+  );
+});
+
+test("checkout setup challenges pause safely before any payment action", async () => {
+  const fixture = executorFixture({
+    async openCheckout() {
+      return { ok: false, status: "address_required", reason: "address_required" };
+    },
+  });
+  const { adapter } = makeAdapter(fixture.executor);
+  assert.deepEqual(await adapter.openCheckout(attempt), {
+    needsUserAction: true,
+    reason: "address_required",
+    status: "address_required",
+  });
+  assert.deepEqual(fixture.calls.at(-1), ["requestUserAction", { reason: "address_required" }]);
+});
+
+test("malformed user-action details fall back to a safe status reason", async () => {
+  const fixture = executorFixture({
+    async openCheckout() {
+      return {
+        ok: false,
+        status: "needs_user_action",
+        reason: "raw checkout body with sensitive details",
+      };
+    },
+  });
+  const { adapter } = makeAdapter(fixture.executor);
+  assert.deepEqual(await adapter.openCheckout(attempt), {
+    needsUserAction: true,
+    reason: "needs_user_action",
+    status: "needs_user_action",
+  });
+});
+
 test("challenge states at every pre-payment phase request user action and never fail closed as payable", async () => {
   for (const phase of ["openListing", "inspectListing", "openCheckout", "inspectCheckout"]) {
     const fixture = executorFixture();

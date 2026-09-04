@@ -6,9 +6,10 @@ import { PurchaseQueue } from "../../src/core/queue.js";
 import { PurchasePolicy } from "../../src/core/policy.js";
 import { EXECUTION_MODES, ATTEMPT_STATES, RESERVATION_STATES } from "../../src/core/types.js";
 import { PAYMENT_OUTCOMES, RECONCILE_OUTCOMES } from "../../src/core/browser-executor.js";
+import { BrowserAutomationError } from "../../src/browser/errors.js";
 import { makeClock, makeEvent, makePage } from "../helpers.js";
 
-function setup({ mode = EXECUTION_MODES.DRY_RUN, executorOverrides = {}, policyOverrides = {} } = {}) {
+function setup({ mode = EXECUTION_MODES.DRY_RUN, executorOverrides = {}, policyOverrides = {}, logger = null } = {}) {
   const clock = makeClock();
   const database = new LocalDatabase(":memory:", { clock: clock.now });
   const store = new AgentStore(database, { clock: clock.now });
@@ -18,6 +19,8 @@ function setup({ mode = EXECUTION_MODES.DRY_RUN, executorOverrides = {}, policyO
     maxDailySpendMinor: 10_000, maxDailyCount: 5, clock: clock.now, ...policyOverrides,
   });
   const calls = [];
+  const logs = [];
+  const effectiveLogger = logger ?? { info(event, fields) { logs.push({ event, ...fields }); } };
   const executor = {
     async openListing(attempt) { calls.push(["openListing", attempt.itemId]); return { tab: "tab" }; },
     async inspectListing(attempt) { calls.push(["inspectListing", attempt.itemId]); return { available: true, itemId: attempt.itemId, priceMinor: attempt.itemPriceMinor }; },
@@ -27,11 +30,11 @@ function setup({ mode = EXECUTION_MODES.DRY_RUN, executorOverrides = {}, policyO
     async reconcileOrder() { calls.push(["reconcileOrder"]); return { outcome: RECONCILE_OUTCOMES.SUCCEEDED, orderId: "order-1" }; },
     ...executorOverrides,
   };
-  const queue = new PurchaseQueue({ store, policy, executor, clock: clock.now });
+  const queue = new PurchaseQueue({ store, policy, executor, logger: effectiveLogger, clock: clock.now });
   queue.setMode(mode);
   const event = makeEvent();
   store.ingestFeedBatch("feed", makePage([event]));
-  return { clock, database, store, policy, executor, queue, calls, event };
+  return { clock, database, store, policy, executor, queue, calls, logs, event };
 }
 
 test("dry-run processes exactly one serial attempt and releases reservation", async () => {
@@ -43,8 +46,67 @@ test("dry-run processes exactly one serial attempt and releases reservation", as
   const attempt = store.getAttempt(enqueued.created[0].attemptId);
   assert.equal(attempt.state, ATTEMPT_STATES.DRY_RUN);
   assert.equal(store.getReservation(attempt.attemptId).state, RESERVATION_STATES.RELEASED);
-  assert.deepEqual(calls.map(([name]) => name), ["openListing", "inspectListing", "openCheckout", "readCheckout"]);
+  assert.deepEqual(calls.map(([name]) => name), ["openListing", "inspectListing", "openCheckout"]);
   assert.equal(store.getNextQueuedAttempt(), null);
+  database.close();
+});
+
+test("dry-run holds the first checkout and leaves later attempts queued", async () => {
+  const { database, store, queue, event, calls } = setup();
+  const second = {
+    ...event.items[0],
+    itemId: "item-2",
+    itemKey: "search-1:GB:item-2",
+    url: "https://www.vinted.co.uk/items/item-2",
+  };
+  const secondEvent = { ...event, eventId: "evt-2", items: [second] };
+  store.ingestFeedBatch("second", makePage([secondEvent], "cursor-2"));
+  await queue.enqueueEvent(event);
+  await queue.enqueueEvent(secondEvent);
+
+  const result = await queue.drain();
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "dry_run_checkout_ready");
+  assert.equal(result.processed.length, 1);
+  assert.equal(store.getAttempt(result.attemptId).state, ATTEMPT_STATES.DRY_RUN);
+  assert.equal(store.listAttempts({ states: [ATTEMPT_STATES.QUEUED] }).length, 1);
+  assert.deepEqual(calls.map(([name]) => name), ["openListing", "inspectListing", "openCheckout"]);
+  assert.equal(calls.some(([name]) => name === "submitPayment"), false);
+
+  const held = await queue.drain();
+  assert.equal(held.blocked, true);
+  assert.equal(held.reason, "dry_run_checkout_ready");
+  assert.equal(held.processed.length, 0);
+  assert.deepEqual(calls.map(([name]) => name), ["openListing", "inspectListing", "openCheckout"]);
+  database.close();
+});
+
+test("queue diagnostics retain the adapter subreason without raw error text", async () => {
+  const { database, store, queue, event, logs } = setup({
+    executorOverrides: {
+      async inspectListing() {
+        throw Object.assign(
+          new BrowserAutomationError("inspect_listing: listing_id_unverified", {
+            code: "BROWSER_ADAPTER_INSPECT_LISTING_FAILED",
+          }),
+          { safeReason: "listing_id_unverified" },
+        );
+      },
+    },
+  });
+  const { created } = await queue.enqueueEvent(event);
+
+  const result = await queue.drain();
+  const attempt = store.getAttempt(created[0].attemptId);
+  assert.equal(result.processed[0].result, "failed");
+  assert.equal(attempt.reason, "listing_id_unverified");
+  assert.equal(store.listTransitions(attempt.attemptId).at(-1).reason, "listing_id_unverified");
+  assert.deepEqual(logs.at(-1), {
+    event: "attempt_failed",
+    attemptId: attempt.attemptId,
+    reason: "listing_id_unverified",
+  });
+  assert.doesNotMatch(attempt.reason, /BROWSER_ADAPTER|raw/);
   database.close();
 });
 
@@ -127,10 +189,12 @@ test("duplicate feed events produce one durable attempt", async () => {
 
 test("final total changes or exceeds policy cause a failed, released attempt", async () => {
   const { database, store, queue, event } = setup({
+    mode: EXECUTION_MODES.AUTO_SUBMIT,
     executorOverrides: {
       async readCheckout(attempt) { return { itemId: attempt.itemId, itemPriceMinor: attempt.itemPriceMinor + 1, totalMinor: 3000, currency: "GBP" }; },
     },
   });
+  queue.arm({ durationMs: 60_000 });
   const { created } = await queue.enqueueEvent(event);
   const result = await queue.drain();
   assert.equal(result.processed[0].result, "failed");

@@ -1,4 +1,4 @@
-export const LATEST_SCHEMA_VERSION = 2;
+export const LATEST_SCHEMA_VERSION = 3;
 
 export const MIGRATIONS = Object.freeze([
   {
@@ -99,6 +99,14 @@ export const MIGRATIONS = Object.freeze([
     statements: [
       `ALTER TABLE feed_cursors ADD COLUMN cursor_expires_at TEXT`,
       `ALTER TABLE purchase_attempts ADD COLUMN recovery_count INTEGER NOT NULL DEFAULT 0`,
+    ],
+  },
+  {
+    version: 3,
+    statements: [
+      // New feeds warm from the retained stream snapshot before becoming
+      // actionable. Existing cursor rows predate that mode and are ready.
+      `ALTER TABLE feed_cursors ADD COLUMN warm_start_complete INTEGER NOT NULL DEFAULT 1`,
     ],
   },
 ]);

@@ -283,25 +283,29 @@ export class AgentStore {
 
   getCursor(feedName) {
     const row = this.database.prepare(
-      "SELECT feed_name, cursor, cursor_expires_at, updated_at FROM feed_cursors WHERE feed_name = ?",
+      "SELECT feed_name, cursor, cursor_expires_at, warm_start_complete, updated_at FROM feed_cursors WHERE feed_name = ?",
     ).get(feedName);
     return row ? {
       feedName: row.feed_name,
       cursor: row.cursor,
       cursorExpiresAt: row.cursor_expires_at,
+      warmStartComplete: Boolean(Number(row.warm_start_complete ?? 1)),
       updatedAt: row.updated_at,
     } : null;
   }
 
-  setCursor(feedName, cursor, cursorExpiresAt = null) {
+  setCursor(feedName, cursor, cursorExpiresAt = null, { warmStartComplete = true } = {}) {
     const now = this.now();
     this.database.prepare(`
-      INSERT INTO feed_cursors(feed_name, cursor, cursor_expires_at, updated_at) VALUES (?, ?, ?, ?)
+      INSERT INTO feed_cursors(
+        feed_name, cursor, cursor_expires_at, warm_start_complete, updated_at
+      ) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(feed_name) DO UPDATE SET
         cursor = excluded.cursor,
         cursor_expires_at = excluded.cursor_expires_at,
+        warm_start_complete = excluded.warm_start_complete,
         updated_at = excluded.updated_at
-    `).run(feedName, cursor ?? null, cursorExpiresAt ?? null, now);
+    `).run(feedName, cursor ?? null, cursorExpiresAt ?? null, warmStartComplete ? 1 : 0, now);
   }
 
   /**
@@ -374,10 +378,13 @@ export class AgentStore {
         }
       }
       this.database.prepare(`
-        INSERT INTO feed_cursors(feed_name, cursor, cursor_expires_at, updated_at) VALUES (?, ?, ?, ?)
+        INSERT INTO feed_cursors(
+          feed_name, cursor, cursor_expires_at, warm_start_complete, updated_at
+        ) VALUES (?, ?, ?, 1, ?)
         ON CONFLICT(feed_name) DO UPDATE SET
           cursor = excluded.cursor,
           cursor_expires_at = excluded.cursor_expires_at,
+          warm_start_complete = excluded.warm_start_complete,
           updated_at = excluded.updated_at
       `).run(feedName, nextCursor ?? null, cursorExpiresAt ?? null, now);
         return { insertedEvents, duplicateEvents, insertedItems, duplicateItems, nextCursor: nextCursor ?? null };

@@ -3,6 +3,7 @@ coverage/
 dist/
 data/
 profile/
+profile-*/
 *.db
 *.sqlite
 *.sqlite3

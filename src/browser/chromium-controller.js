@@ -1,6 +1,7 @@
 import { mkdir, chmod } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, relative, resolve } from "node:path";
 
 import {
   isAllowedVintedUrl,
@@ -19,12 +20,30 @@ const DEFAULT_EXECUTABLES = Object.freeze([
   "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
 ]);
 
+const ARC_EXECUTABLE_SUFFIX = "/Arc.app/Contents/MacOS/Arc";
+const ARC_LAUNCH_TIMEOUT_MS = 15_000;
+
 const APPLE_ID_ORIGIN = "https://appleid.apple.com";
 const DEFAULT_APPLE_AUTH_WINDOW_MS = 10 * 60_000;
 
 function discoverExecutable(explicit) {
   const candidates = [explicit, process.env.LOCAL_BUY_CHROME_PATH, ...DEFAULT_EXECUTABLES];
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? null;
+}
+
+function isArcExecutable(value) {
+  return resolve(String(value ?? "")).endsWith(ARC_EXECUTABLE_SUFFIX);
+}
+
+function isInside(parent, child) {
+  const path = relative(parent, child);
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function boundedArcLaunchTimeout(value) {
+  return Number.isFinite(value) && value > 0
+    ? Math.min(value, ARC_LAUNCH_TIMEOUT_MS)
+    : ARC_LAUNCH_TIMEOUT_MS;
 }
 
 function ensureAbsoluteDirectory(value) {
@@ -71,6 +90,19 @@ export class ChromiumController {
     this.playwright = playwright;
     this.launchOptions = { ...launchOptions };
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
+
+    if (process.platform === "darwin" && isArcExecutable(this.executablePath)) {
+      const personalArcProfile = resolve(
+        homedir(),
+        "Library/Application Support/Arc/User Data",
+      );
+      if (isInside(personalArcProfile, this.userDataDir)) {
+        throw new BrowserAutomationError(
+          "Arc automation requires a separate dedicated user-data directory",
+          { code: "BROWSER_PERSONAL_PROFILE_FORBIDDEN" },
+        );
+      }
+    }
 
     if (this.launchOptions.headless === true) {
       throw new BrowserAutomationError(
@@ -127,13 +159,23 @@ export class ChromiumController {
       );
     }
 
-    const options = {
-      ...this.launchOptions,
-      headless: false,
-      ...(this.executablePath ? { executablePath: this.executablePath } : {}),
-    };
-
     try {
+      if (isArcExecutable(this.executablePath)) {
+        if (process.platform !== "darwin") {
+          throw new BrowserAutomationError(
+            "The Arc-compatible launch path is supported only on macOS",
+            { code: "BROWSER_ARC_UNSUPPORTED" },
+          );
+        }
+      }
+      const options = {
+        ...this.launchOptions,
+        headless: false,
+        ...(this.executablePath ? { executablePath: this.executablePath } : {}),
+      };
+      if (isArcExecutable(this.executablePath)) {
+        options.timeout = boundedArcLaunchTimeout(this.launchOptions.timeout);
+      }
       this.#context = await chromium.launchPersistentContext(
         this.userDataDir,
         options,
@@ -151,8 +193,17 @@ export class ChromiumController {
       } catch {
         // Preserve the original launch/guard error.
       }
-      if (cause instanceof BrowserAutomationError && cause.code === "BROWSER_ORIGIN_GUARD_UNAVAILABLE") {
+      if (
+        cause instanceof BrowserAutomationError &&
+        cause.code === "BROWSER_ORIGIN_GUARD_UNAVAILABLE"
+      ) {
         throw cause;
+      }
+      if (isArcExecutable(this.executablePath)) {
+        throw new BrowserAutomationError(
+          "Unable to launch Arc in the dedicated profile; close the normal Arc instance and retry",
+          { code: "BROWSER_ARC_INSTANCE_CONFLICT", cause },
+        );
       }
       throw new BrowserAutomationError("Unable to launch visible Chromium", {
         code: "BROWSER_LAUNCH_FAILED",

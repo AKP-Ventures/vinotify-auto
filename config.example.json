@@ -6,8 +6,8 @@
     "discoveryRefreshSeconds": 60
   },
   "browser": {
-    "userDataDir": "profile",
-    "executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    "userDataDir": "profile-arc",
+    "executablePath": "/Applications/Arc.app/Contents/MacOS/Arc"
   },
   "storage": {
     "databasePath": "data/agent.sqlite3",

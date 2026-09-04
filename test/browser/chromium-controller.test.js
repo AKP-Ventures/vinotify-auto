@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 
 import { ChromiumController } from "../../src/browser/chromium-controller.js";
@@ -136,6 +137,16 @@ class GuardContext {
     this.listeners.set(event, listener);
   }
   async close() {}
+}
+
+class ArcContext extends GuardContext {
+  constructor(pages) {
+    super(pages);
+    this.closed = 0;
+  }
+  async close() {
+    this.closed += 1;
+  }
 }
 
 test("controller launches a visible persistent system-Chrome context", async () => {
@@ -478,4 +489,88 @@ test("forbidden main navigation fails closed when route abort is unavailable", a
 
   await controller.close();
   await rm(profile, { recursive: true, force: true });
+});
+
+const ARC_EXECUTABLE = "/Applications/Arc.app/Contents/MacOS/Arc";
+const ARC_AVAILABLE = process.platform === "darwin" && existsSync(ARC_EXECUTABLE);
+
+test("Arc uses the dedicated persistent profile with a bounded native launch", {
+  skip: !ARC_AVAILABLE,
+}, async () => {
+  const profile = await mkdtemp(join(tmpdir(), "local-buy-agent-arc-profile-"));
+  const page = new GuardPage();
+  const context = new ArcContext([page]);
+  const calls = [];
+  const controller = new ChromiumController({
+    userDataDir: profile,
+    executablePath: ARC_EXECUTABLE,
+    playwright: {
+      chromium: {
+        async launchPersistentContext(userDataDir, options) {
+          calls.push({ userDataDir, options });
+          return context;
+        },
+      },
+    },
+    launchOptions: { timeout: 321 },
+  });
+
+  await controller.start();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].userDataDir, profile);
+  assert.equal(calls[0].options.executablePath, ARC_EXECUTABLE);
+  assert.equal(calls[0].options.headless, false);
+  assert.equal(calls[0].options.timeout, 321);
+  assert.equal(typeof context.routeHandler, "function", "origin guard must be installed before navigation");
+  await controller.navigate("https://www.vinted.co.uk/");
+  assert.equal(page.url(), "https://www.vinted.co.uk/");
+  await controller.close();
+  assert.equal(context.closed, 1);
+  await rm(profile, { recursive: true, force: true });
+});
+
+test("Arc launch timeout is surfaced as an actionable normal-instance conflict", {
+  skip: !ARC_AVAILABLE,
+}, async () => {
+  const profile = await mkdtemp(join(tmpdir(), "local-buy-agent-arc-conflict-"));
+  const calls = [];
+  const controller = new ChromiumController({
+    userDataDir: profile,
+    executablePath: ARC_EXECUTABLE,
+    playwright: {
+      chromium: {
+        async launchPersistentContext(_userDataDir, options) {
+          calls.push(options);
+          throw new Error("launch timeout");
+        },
+      },
+    },
+    launchOptions: { timeout: 30_000 },
+  });
+
+  await assert.rejects(
+    () => controller.start(),
+    (error) =>
+      error instanceof BrowserAutomationError &&
+      error.code === "BROWSER_ARC_INSTANCE_CONFLICT" &&
+      error.message.includes("close the normal Arc instance"),
+  );
+  assert.equal(calls[0].timeout, 15_000);
+  await rm(profile, { recursive: true, force: true });
+});
+
+test("Arc refuses the personal profile path", { skip: !ARC_AVAILABLE }, () => {
+  const personalProfile = resolve(
+    homedir(),
+    "Library/Application Support/Arc/User Data",
+  );
+  assert.throws(
+    () => new ChromiumController({
+      userDataDir: personalProfile,
+      executablePath: ARC_EXECUTABLE,
+    }),
+    (error) =>
+      error instanceof BrowserAutomationError &&
+      error.code === "BROWSER_PERSONAL_PROFILE_FORBIDDEN",
+  );
 });

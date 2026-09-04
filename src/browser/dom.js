@@ -1,5 +1,7 @@
 import { classifyText, VINTED_SELECTORS } from "./selectors.js";
 
+class AmbiguousSelectorError extends Error {}
+
 /**
  * Small Playwright-compatible adapter helpers.  Keeping these operations
  * here means the executor never relies on page.evaluate or browser storage,
@@ -7,22 +9,72 @@ import { classifyText, VINTED_SELECTORS } from "./selectors.js";
  * browser.
  */
 
+async function resolveSelector(page, selector) {
+  if (!page || !selector) return null;
+  if (typeof selector === "string") {
+    if (typeof page.locator !== "function") return null;
+    return page.locator(selector);
+  }
+  if (typeof selector !== "object") return null;
+
+  if (selector.kind === "role") {
+    if (typeof page.getByRole !== "function") return null;
+    return page.getByRole(selector.role, selector.options ?? {});
+  }
+  if (selector.kind === "text") {
+    if (typeof page.getByText !== "function") return null;
+    return page.getByText(selector.value, selector.options ?? {});
+  }
+  if (selector.kind === "within-heading") {
+    if (typeof page.getByRole !== "function") return null;
+    const heading = page.getByRole("heading", {
+      name: selector.heading,
+      exact: selector.options?.exact ?? true,
+    });
+    if (!heading) return null;
+    if (typeof heading.count === "function") {
+      let count;
+      try {
+        count = await heading.count();
+      } catch {
+        return null;
+      }
+      if (!Number.isFinite(count) || count < 1) return null;
+      if (count !== 1) throw new AmbiguousSelectorError("heading selector matched multiple elements");
+    }
+    if (typeof heading.locator !== "function") return null;
+    const parent = heading.locator("xpath=..");
+    if (!parent || typeof parent.getByText !== "function") return null;
+    return parent.getByText(selector.pattern);
+  }
+  return null;
+}
+
 export async function firstLocator(page, selectors) {
-  if (!page || typeof page.locator !== "function") return null;
+  if (
+    !page ||
+    (typeof page.locator !== "function" &&
+      typeof page.getByRole !== "function" &&
+      typeof page.getByText !== "function")
+  ) return null;
   for (const selector of selectors ?? []) {
     try {
-      const candidate = page.locator(selector);
-      const locator =
-        candidate && typeof candidate.first === "function"
-          ? candidate.first()
-          : candidate;
+      // Semantic descriptors use page.getByRole/getByText and therefore do
+      // not require page.locator.  CSS selectors remain available for the
+      // explicit compatibility contract and test fixtures.
+      const candidate = await resolveSelector(page, selector);
+      const locator = candidate;
       if (!locator) continue;
       if (typeof locator.count === "function") {
         const count = await locator.count();
         if (!Number.isFinite(count) || count < 1) continue;
+        // A duplicated control or value is not safe evidence.  Do not pick
+        // the first match merely because it happens to be clickable.
+        if (count !== 1) return null;
       }
       return { locator, selector };
-    } catch {
+    } catch (error) {
+      if (error instanceof AmbiguousSelectorError) return null;
       // A selector unsupported by a fixture/browser version is not evidence
       // that a page is safe.  Continue to the next explicit selector.
     }
@@ -70,19 +122,32 @@ export async function readLocatorAttribute(locator, name) {
 export async function readSelectorValues(
   page,
   selectors,
-  { attributes = [], parse, maxMatches = 64 } = {},
+  {
+    attributes = [],
+    parse,
+    maxMatches = 64,
+    rejectParseFailure = false,
+    rejectDuplicateMatches = false,
+  } = {},
 ) {
   const values = [];
-  if (!page || typeof page.locator !== "function" || typeof parse !== "function") {
+  if (
+    !page ||
+    (typeof page.locator !== "function" &&
+      typeof page.getByRole !== "function" &&
+      typeof page.getByText !== "function") ||
+    typeof parse !== "function"
+  ) {
     return { values, ambiguous: true };
   }
 
   for (const selector of selectors ?? []) {
     let collection;
     try {
-      collection = page.locator(selector);
+      collection = await resolveSelector(page, selector);
       if (!collection) continue;
-    } catch {
+    } catch (error) {
+      if (error instanceof AmbiguousSelectorError) return { values, ambiguous: true };
       continue;
     }
 
@@ -101,6 +166,7 @@ export async function readSelectorValues(
       return { values, ambiguous: true };
     }
 
+    const selectorValues = [];
     for (let index = 0; index < count; index += 1) {
       const locator =
         count > 1
@@ -121,8 +187,18 @@ export async function readSelectorValues(
       } catch {
         value = null;
       }
+      if (rejectParseFailure && (raw.text !== null || attributes.some((attribute) => raw[attribute] !== null))) {
+        if (value === null || value === undefined || String(value).trim() === "") {
+          return { values: [...new Set(values)], ambiguous: true };
+        }
+      }
       if (value !== null && value !== undefined && String(value).trim() !== "") {
-        values.push(String(value).trim());
+        const normalized = String(value).trim();
+        if (rejectDuplicateMatches && selectorValues.includes(normalized)) {
+          return { values: [...new Set(values)], ambiguous: true };
+        }
+        selectorValues.push(normalized);
+        values.push(normalized);
       }
     }
   }
@@ -170,8 +246,24 @@ export async function pageBodyText(page) {
 }
 
 export async function hasVisibleSelector(page, selectors) {
-  const match = await firstLocator(page, selectors);
-  return Boolean(match && (await locatorIsVisible(match.locator)));
+  for (const selector of selectors ?? []) {
+    const match = await firstLocator(page, [selector]);
+    if (match && (await locatorIsVisible(match.locator))) return true;
+    // A duplicate state marker is unsafe to dismiss as "not present".  Treat
+    // it as visible evidence so callers remain blocked until the page is
+    // unambiguous again.
+    if (!match) {
+      try {
+        const candidate = await resolveSelector(page, selector);
+        if (candidate && typeof candidate.count === "function" && (await candidate.count()) > 1) {
+          return true;
+        }
+      } catch (error) {
+        if (error instanceof AmbiguousSelectorError) return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**

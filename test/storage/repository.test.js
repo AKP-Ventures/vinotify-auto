@@ -20,11 +20,41 @@ function storeWithEvent() {
 
 test("schema migrations create durable tables and upgrade marker", () => {
   const { database } = storeWithEvent();
-  assert.equal(database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 2);
+  assert.equal(database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get().version, 3);
   for (const table of ["settings", "feed_cursors", "feed_events", "feed_items", "purchase_attempts", "budget_reservations", "attempt_transitions", "local_logs"]) {
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table).name, table);
   }
   database.close();
+});
+
+test("schema v3 preserves existing cursors as already warmed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "vinotify-auto-v2-"));
+  const filename = join(directory, "agent.sqlite");
+  let database = new LocalDatabase(filename);
+  database.exec("DELETE FROM schema_migrations WHERE version = 3");
+  database.exec("ALTER TABLE feed_cursors RENAME TO feed_cursors_v3");
+  database.exec(`CREATE TABLE feed_cursors (
+    feed_name TEXT PRIMARY KEY,
+    cursor TEXT,
+    updated_at TEXT NOT NULL,
+    cursor_expires_at TEXT
+  )`);
+  database.exec(`INSERT INTO feed_cursors(feed_name, cursor, updated_at, cursor_expires_at)
+    VALUES ('existing', 'cursor-2', '2026-08-23T12:00:00.000Z', NULL)`);
+  database.exec("DROP TABLE feed_cursors_v3");
+  database.close();
+
+  database = new LocalDatabase(filename);
+  const store = new AgentStore(database);
+  assert.deepEqual(store.getCursor("existing"), {
+    feedName: "existing",
+    cursor: "cursor-2",
+    cursorExpiresAt: null,
+    warmStartComplete: true,
+    updatedAt: "2026-08-23T12:00:00.000Z",
+  });
+  database.close();
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("cursor, settings and attempts survive a close/reopen", async () => {

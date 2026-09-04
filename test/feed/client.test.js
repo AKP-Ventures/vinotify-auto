@@ -80,6 +80,7 @@ test("feed ingestor advances cursor atomically and deduplicates replay", async (
   const clock = makeClock();
   const db = new LocalDatabase(":memory:", { clock: clock.now });
   const store = new AgentStore(db, { clock: clock.now });
+  store.setCursor("search-1", "cursor-0");
   const event = makeEvent();
   let calls = 0;
   const ingestor = new FeedIngestor({
@@ -97,6 +98,64 @@ test("feed ingestor advances cursor atomically and deduplicates replay", async (
   assert.deepEqual(second.result.duplicateEvents, ["evt-1"]);
   assert.equal(store.getCursor("search-1").cursor, "cursor-2");
   assert.equal(store.listItemsForEvent("evt-1").length, 1);
+  db.close();
+});
+
+test("an unseeded feed drains a multi-page snapshot before using the persisted cursor", async () => {
+  const clock = makeClock();
+  const db = new LocalDatabase(":memory:", { clock: clock.now });
+  const store = new AgentStore(db, { clock: clock.now });
+  const snapshotEvent = makeEvent({ eventId: "snapshot-1", itemId: "snapshot-item-1" });
+  const snapshotPage = Array.from({ length: 50 }, (_, index) => makeEvent({
+    eventId: `snapshot-${index + 2}`,
+    itemId: `snapshot-item-${index + 2}`,
+  }));
+  const snapshotTail = makeEvent({ eventId: "snapshot-tail", itemId: "snapshot-item-tail" });
+  const newEvent = makeEvent({ eventId: "new", itemId: "new-item" });
+  const calls = [];
+  const client = {
+    poll: async ({ cursor }) => {
+      calls.push(cursor);
+      if (calls.length === 1) return makePage([snapshotEvent], "cursor-snapshot-1");
+      if (calls.length === 2) return { ...makePage(snapshotPage, "cursor-snapshot-2"), hasMore: true };
+      if (calls.length === 3) return makePage([snapshotTail], "cursor-snapshot-tail");
+      if (calls.length === 4) return makePage([], "cursor-snapshot-tail");
+      return makePage([newEvent], "cursor-new");
+    },
+  };
+
+  const first = await new FeedIngestor({ client, store, feedName: "search-1" }).pollOnce();
+  assert.equal(first.result.warmed, true);
+  assert.equal(first.result.skippedEventCount, 1);
+  assert.equal(first.result.warmStartComplete, false);
+  assert.deepEqual(first.result.insertedItems, []);
+  assert.equal(store.getEvent(snapshotEvent.eventId), null);
+  assert.deepEqual(store.listUnattemptedFeedItems(), []);
+  assert.equal(store.getCursor("search-1").cursor, "cursor-snapshot-1");
+  assert.equal(store.getCursor("search-1").warmStartComplete, false);
+
+  // A fresh ingestor models a process restart and must resume at the durable
+  // warm-start cursor instead of opening another unseeded snapshot or
+  // ingesting the remaining backfill.
+  const restarted = new FeedIngestor({ client, store, feedName: "search-1" });
+  const second = await restarted.pollOnce();
+  assert.equal(calls[0], null);
+  assert.equal(calls[1], "cursor-snapshot-1");
+  assert.deepEqual(second.result.insertedItems, []);
+  assert.equal(store.getEvent(snapshotPage[0].eventId), null);
+  assert.equal(store.getCursor("search-1").cursor, "cursor-snapshot-2");
+  assert.equal(store.getCursor("search-1").warmStartComplete, false);
+
+  await restarted.pollOnce();
+  await restarted.pollOnce();
+  assert.equal(store.getEvent(snapshotTail.eventId), null);
+  assert.equal(store.getCursor("search-1").warmStartComplete, true);
+
+  const third = await restarted.pollOnce();
+  assert.equal(calls[4], "cursor-snapshot-tail");
+  assert.deepEqual(third.result.insertedItems, [newEvent.items[0].itemKey]);
+  assert.equal(store.listUnattemptedFeedItems().length, 1);
+  assert.equal(store.getCursor("search-1").cursor, "cursor-new");
   db.close();
 });
 

@@ -9,6 +9,8 @@ const CHALLENGE_STATES = new Set([
   "login_required",
   "captcha",
   "verification_required",
+  "address_required",
+  "checkout_setup_required",
 ]);
 const PAYMENT_CALL_CROSSED_REASONS = new Set([
   "payment_submitted_reconcile_required",
@@ -34,19 +36,42 @@ function asMinor(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+const SAFE_REASON = /^[A-Za-z][A-Za-z0-9_]{0,95}$/;
+
+function safeReason(value, fallback = null) {
+  if (typeof value !== "string") return fallback;
+  const reason = value.trim();
+  return SAFE_REASON.test(reason) ? reason : fallback;
+}
+
+function resultReason(result, fallback = "unknown_result") {
+  return safeReason(result?.reason) ?? safeReason(result?.status) ?? fallback;
+}
+
 function adapterError(phase, reason, result) {
-  return new BrowserAutomationError(`${phase}: ${reason}`, {
+  const safe = safeReason(reason, "adapter_error");
+  const error = new BrowserAutomationError(`${phase}: ${safe}`, {
     code: `BROWSER_ADAPTER_${String(phase).toUpperCase()}_FAILED`,
     cause: result instanceof Error ? result : undefined,
   });
+  // Keep the phase-level code for compatibility while exposing only the
+  // allow-listed subreason to the durable queue and diagnostics.
+  error.safeReason = safe;
+  error.reason = safe;
+  return error;
 }
 
 function challengeReason(result) {
-  return result?.reason ?? result?.status ?? "user_action_required";
+  return resultReason(result, "user_action_required");
 }
 
 function isChallenge(result) {
-  return CHALLENGE_STATES.has(result?.status) || result?.status === "user_action_required";
+  return result?.needsUserAction === true
+    || CHALLENGE_STATES.has(result?.status)
+    || CHALLENGE_STATES.has(result?.reason)
+    || result?.status === "user_action_required"
+    || result?.status === "needs_user_action"
+    || result?.outcome === "needs_user_action";
 }
 
 /**
@@ -99,7 +124,11 @@ export class PurchaseQueueBrowserAdapter {
         itemId: attempt?.itemId,
       });
     } catch (error) {
-      throw adapterError("lookup", "item_lookup_failed", error);
+      throw adapterError(
+        "lookup",
+        safeReason(error?.safeReason) ?? safeReason(error?.reason) ?? "item_lookup_failed",
+        error,
+      );
     }
     const item = normalizeStoredItem(raw, attempt);
     this.#itemCache.set(key, item);
@@ -232,7 +261,7 @@ export class PurchaseQueueBrowserAdapter {
     // a button that looked unavailable must therefore remain ambiguous.
     return {
       outcome: PAYMENT_OUTCOMES.UNKNOWN,
-      reason: result?.reason ?? result?.status ?? "payment_outcome_unknown",
+      reason: resultReason(result, "payment_outcome_unknown"),
     };
   }
 
@@ -264,12 +293,12 @@ export class PurchaseQueueBrowserAdapter {
     if (result?.status === "failed" && result.ok === false) {
       return {
         outcome: RECONCILE_OUTCOMES.FAILED,
-        reason: result.reason ?? "order_failed",
+        reason: resultReason(result, "order_failed"),
       };
     }
     return {
       outcome: RECONCILE_OUTCOMES.UNKNOWN,
-      reason: result?.reason ?? result?.status ?? "order_state_unknown",
+      reason: resultReason(result, "order_state_unknown"),
     };
   }
 
@@ -285,7 +314,11 @@ export class PurchaseQueueBrowserAdapter {
     try {
       return await this.executor[method](input, context);
     } catch (error) {
-      throw adapterError(method, "executor_failed", error);
+      throw adapterError(
+        method,
+        safeReason(error?.safeReason) ?? safeReason(error?.reason) ?? "executor_failed",
+        error,
+      );
     }
   }
 
@@ -322,14 +355,14 @@ function normalizeStoredItem(raw, attempt) {
 
 function requireOk(result, phase) {
   if (!result?.ok) {
-    if (isChallenge(result)) throw adapterError(phase, `challenge_${result.status}`, result);
-    throw adapterError(phase, result?.reason ?? result?.status ?? "unknown_result", result);
+    if (isChallenge(result)) throw adapterError(phase, `challenge_${resultReason(result)}`, result);
+    throw adapterError(phase, resultReason(result), result);
   }
 }
 
 function requireOkOrChallenge(result, phase) {
   if (!result?.ok && !isChallenge(result)) {
-    throw adapterError(phase, result?.reason ?? result?.status ?? "unknown_result", result);
+    throw adapterError(phase, resultReason(result), result);
   }
 }
 
@@ -337,7 +370,7 @@ function toNeedsUserAction(result) {
   return {
     needsUserAction: true,
     reason: challengeReason(result),
-    status: result.status,
+    status: safeReason(result?.status, "user_action_required"),
   };
 }
 

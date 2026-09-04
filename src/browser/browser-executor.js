@@ -2,6 +2,7 @@ import {
   classifyPageState,
   clickLocator,
   firstLocator,
+  hasVisibleSelector,
   locatorIsEnabled,
   locatorIsVisible,
   pageUrl,
@@ -11,7 +12,9 @@ import {
 } from "./dom.js";
 import {
   isAllowedListingUrl,
+  isAllowedCheckoutUrl,
   isAllowedVintedUrl,
+  extractListingId,
   normalizeAvailability,
   normalizeCurrency,
   normalizeItemId,
@@ -55,6 +58,35 @@ function parseOrderIdentity({ text, "data-order-id": dataId, content }) {
 
 function safeMinor(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function parsePriceEvidence(raw) {
+  const price = parseMoney({
+    text: raw.text,
+    amountAttribute: raw.content || raw["data-price"] || "",
+    currencyAttribute: raw["data-currency"] || "",
+  });
+  return price ? JSON.stringify(price) : null;
+}
+
+function decodePriceEvidence(values) {
+  const prices = [];
+  for (const value of values ?? []) {
+    try {
+      const parsed = JSON.parse(value);
+      if (
+        parsed &&
+        Number.isSafeInteger(parsed.amountMinor) &&
+        parsed.amountMinor >= 0 &&
+        typeof parsed.currency === "string"
+      ) {
+        prices.push(parsed);
+      }
+    } catch {
+      return null;
+    }
+  }
+  return prices;
 }
 
 function expectedPriceFrom(input, fallback = {}) {
@@ -183,48 +215,111 @@ export class BrowserExecutor {
     const state = await this.#targetedState(page);
     if (state) return blocked(state, { itemId: normalizedItemId });
 
-    const idMatch = await firstLocator(page, VINTED_SELECTORS.listing.id);
-    const id = normalizeItemId({
-      text: await readLocatorText(idMatch?.locator),
-      dataId: await readLocatorAttribute(idMatch?.locator, "data-item-id"),
-      content: await readLocatorAttribute(idMatch?.locator, "content"),
-    });
-    if (!id || id !== normalizedItemId) {
+    // The live item page exposes its canonical identity in the URL.  A DOM
+    // identity marker, when present, is an additional consistency check but
+    // is not required because the exact-origin `/items/<id>-slug` URL is
+    // already validated above.
+    if (extractListingId(currentUrl) !== normalizedItemId) {
       return unknown("listing_id_unverified", { itemId: normalizedItemId });
     }
 
-    const availabilityMatch = await firstLocator(
+    const idEvidence = await readSelectorValues(
+      page,
+      VINTED_SELECTORS.listing.id,
+      {
+        attributes: ["data-item-id", "content"],
+        parse: parseItemIdentity,
+        rejectParseFailure: true,
+      },
+    );
+    if (idEvidence.ambiguous || idEvidence.values.length > 1) {
+      return unknown("listing_id_unverified", { itemId: normalizedItemId });
+    }
+    if (idEvidence.values.length === 1 && idEvidence.values[0] !== normalizedItemId) {
+      return unknown("listing_id_unverified", { itemId: normalizedItemId });
+    }
+
+    const availabilityEvidence = await readSelectorValues(
       page,
       VINTED_SELECTORS.listing.availability,
+      {
+        attributes: ["data-available"],
+        parse: ({ text, "data-available": availableAttribute }) => {
+          const value = normalizeAvailability({ text, availableAttribute });
+          return value === null ? null : String(value);
+        },
+        rejectParseFailure: true,
+      },
     );
-    const availability = normalizeAvailability({
-      text: await readLocatorText(availabilityMatch?.locator),
-      availableAttribute: await readLocatorAttribute(
-        availabilityMatch?.locator,
-        "data-available",
-      ),
-    });
+    if (availabilityEvidence.ambiguous || availabilityEvidence.values.length > 1) {
+      return unknown("listing_availability_unverified", { itemId: normalizedItemId });
+    }
+    const availability = availabilityEvidence.values.length === 1
+      ? availabilityEvidence.values[0] === "true"
+      : null;
     if (availability === false) {
       return { ok: false, status: "sold", reason: "listing_unavailable", itemId: normalizedItemId };
     }
-    if (availability !== true) {
-      return unknown("listing_availability_unverified", { itemId: normalizedItemId });
+
+    // The live listing can show both the item price and a buyer-protection
+    // amount. Read every visible candidate, then accept only one exact match
+    // for the expected item amount; never select the first global text match.
+    const priceEvidence = await readSelectorValues(
+      page,
+      VINTED_SELECTORS.listing.price,
+      {
+        attributes: ["content", "data-price", "data-currency"],
+        parse: parsePriceEvidence,
+        rejectDuplicateMatches: true,
+      },
+    );
+    if (priceEvidence.ambiguous) {
+      return unknown("listing_price_unverified", { itemId: normalizedItemId });
+    }
+    const observedPrices = decodePriceEvidence(priceEvidence.values);
+    if (!observedPrices) {
+      return unknown("listing_price_unverified", { itemId: normalizedItemId });
     }
 
-    const priceMatch = await firstLocator(page, VINTED_SELECTORS.listing.price);
-    const currencyMatch = await firstLocator(page, VINTED_SELECTORS.listing.currency);
-    const price = parseMoney({
-      text: await readLocatorText(priceMatch?.locator),
-      amountAttribute:
-        (await readLocatorAttribute(priceMatch?.locator, "content")) ??
-        (await readLocatorAttribute(priceMatch?.locator, "data-price")) ??
-        "",
-      currencyAttribute:
-        (await readLocatorAttribute(priceMatch?.locator, "data-currency")) ??
-        (await readLocatorAttribute(currencyMatch?.locator, "content")) ??
-        (await readLocatorText(currencyMatch?.locator)) ??
-        "",
-    });
+    let price;
+    if (observedPrices.length > 0) {
+      const expectedMatches = observedPrices.filter(
+        (candidate) =>
+          candidate.amountMinor === expected.amountMinor &&
+          candidate.currency === expected.currency,
+      );
+      if (expectedMatches.length === 1) {
+        [price] = expectedMatches;
+      } else if (observedPrices.length === 1) {
+        [price] = observedPrices;
+      } else {
+        return unknown("listing_price_unverified", { itemId: normalizedItemId });
+      }
+    } else {
+      // Explicit price elements may expose a bare numeric attribute and a
+      // separate currency element. This fallback remains structural and
+      // excludes the global semantic text locator above.
+      const explicitPriceSelectors = VINTED_SELECTORS.listing.price.filter(
+        (selector) => typeof selector === "string",
+      );
+      const explicitCurrencySelectors = VINTED_SELECTORS.listing.currency.filter(
+        (selector) => typeof selector === "string",
+      );
+      const priceMatch = await firstLocator(page, explicitPriceSelectors);
+      const currencyMatch = await firstLocator(page, explicitCurrencySelectors);
+      price = parseMoney({
+        text: await readLocatorText(priceMatch?.locator),
+        amountAttribute:
+          (await readLocatorAttribute(priceMatch?.locator, "content")) ??
+          (await readLocatorAttribute(priceMatch?.locator, "data-price")) ??
+          "",
+        currencyAttribute:
+          (await readLocatorAttribute(priceMatch?.locator, "data-currency")) ??
+          (await readLocatorAttribute(currencyMatch?.locator, "content")) ??
+          (await readLocatorText(currencyMatch?.locator)) ??
+          "",
+      });
+    }
     if (!price) return unknown("listing_price_unverified", { itemId: normalizedItemId });
     if (
       price.amountMinor !== expected.amountMinor ||
@@ -300,7 +395,15 @@ export class BrowserExecutor {
     this.#checkout = { buyClicked: true, inspected: false };
     try {
       await clickLocator(buyButton.locator);
-      if (typeof page.waitForLoadState === "function") {
+      if (typeof page.waitForURL === "function") {
+        // Vinted changes this route client-side. The click can resolve while
+        // the listing URL is still visible, so wait for the exact positive
+        // checkout boundary instead of treating that normal delay as failure.
+        await page.waitForURL(
+          (url) => isAllowedCheckoutUrl(String(url)),
+          { waitUntil: "domcontentloaded", timeout: 15_000 },
+        ).catch(() => {});
+      } else if (typeof page.waitForLoadState === "function") {
         await page.waitForLoadState("domcontentloaded").catch(() => {});
       }
     } catch {
@@ -309,6 +412,9 @@ export class BrowserExecutor {
     const currentUrl = await pageUrl(page);
     if (!isAllowedVintedUrl(currentUrl)) {
       return unknown("checkout_origin_blocked", { itemId: normalizedItemId });
+    }
+    if (!isAllowedCheckoutUrl(currentUrl)) {
+      return unknown("checkout_path_unverified", { itemId: normalizedItemId });
     }
     const afterState = await this.#targetedState(page);
     if (afterState) return blocked(afterState, { itemId: normalizedItemId });
@@ -335,8 +441,19 @@ export class BrowserExecutor {
     if (!page) return unknown("browser_unavailable");
     const currentUrl = await pageUrl(page);
     if (!isAllowedVintedUrl(currentUrl)) return unknown("checkout_origin_blocked");
+    if (!isAllowedCheckoutUrl(currentUrl)) return unknown("checkout_path_unverified");
     const state = await this.#targetedState(page);
     if (state) return blocked(state, { itemId: normalizedItemId });
+
+    if (await hasVisibleSelector(page, VINTED_SELECTORS.checkout.setupRequired)) {
+      return {
+        ok: false,
+        status: "needs_user_action",
+        reason: "checkout_setup_required",
+        outcome: "needs_user_action",
+        itemId: normalizedItemId,
+      };
+    }
 
     const totalMatch = await firstLocator(page, VINTED_SELECTORS.checkout.total);
     const currencyMatch = await firstLocator(page, VINTED_SELECTORS.checkout.currency);
@@ -430,6 +547,15 @@ export class BrowserExecutor {
           ? "unknown"
           : undefined;
       return blocked(state, { itemId: normalizedItemId, ...(outcome ? { outcome } : {}) });
+    }
+    if (await hasVisibleSelector(page, VINTED_SELECTORS.checkout.setupRequired)) {
+      return {
+        ok: false,
+        status: "needs_user_action",
+        reason: "checkout_setup_required",
+        outcome: "needs_user_action",
+        itemId: normalizedItemId,
+      };
     }
     const submit = await firstLocator(page, VINTED_SELECTORS.checkout.submitButton);
     if (
@@ -560,7 +686,13 @@ export class BrowserExecutor {
       },
       context,
     );
-    if (result.status === "login_required" || result.status === "captcha" || result.status === "verification_required") {
+    if (
+      result.status === "login_required" ||
+      result.status === "captcha" ||
+      result.status === "verification_required" ||
+      result.status === "needs_user_action" ||
+      result.reason === "checkout_setup_required"
+    ) {
       return {
         needsUserAction: true,
         reason: result.reason,

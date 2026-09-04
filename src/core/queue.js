@@ -12,8 +12,37 @@ import {
 } from "./types.js";
 
 function asErrorReason(error, fallback = "operation_failed") {
-  if (error instanceof PolicyRejection) return error.reason;
-  return error?.code || error?.message || fallback;
+  if (error instanceof PolicyRejection) return resultReason(error.reason, fallback);
+  // Browser adapters expose a deliberately allow-listed subreason while the
+  // public error code remains phase-level. Prefer that stable detail, but do
+  // not persist arbitrary exception messages (which may contain page data).
+  return safeDiagnosticReason(error?.safeReason)
+    ?? safeDiagnosticReason(error?.reason)
+    ?? safeDiagnosticReason(error?.code)
+    ?? safeDiagnosticReason(error?.message)
+    ?? fallback;
+}
+
+const SAFE_REASON = /^[A-Za-z][A-Za-z0-9_]{0,95}$/;
+
+function safeDiagnosticReason(value) {
+  if (typeof value !== "string") return null;
+  const reason = value.trim();
+  return SAFE_REASON.test(reason) ? reason : null;
+}
+
+function resultReason(value, fallback) {
+  return safeDiagnosticReason(value) ?? fallback;
+}
+
+function safeMetadata(value) {
+  if (!value || typeof value !== "object") return null;
+  const metadata = {};
+  for (const key of ["status", "outcome", "reason", "code"]) {
+    const safe = safeDiagnosticReason(value[key]);
+    if (safe) metadata[key] = safe;
+  }
+  return Object.keys(metadata).length > 0 ? metadata : null;
 }
 
 function resultObject(value, field) {
@@ -39,6 +68,7 @@ export class PurchaseQueue {
     this.clock = clock;
     this.drainPromise = null;
     this.searchMembership = null;
+    this.dryRunHeldAttemptId = null;
   }
 
   /**
@@ -96,6 +126,9 @@ export class PurchaseQueue {
   setMode(mode) {
     this.policy.validateMode(mode);
     this.store.setSetting("execution_mode", mode);
+    // A mode change is the explicit operator action that may release a
+    // dry-run checkout hold and allow another queued item to be opened.
+    this.dryRunHeldAttemptId = null;
     this.log("mode_changed", { mode });
     return mode;
   }
@@ -268,6 +301,22 @@ export class PurchaseQueue {
     const processed = [];
     while (true) {
       if (signal?.aborted) throw signal.reason ?? new Error("queue_aborted");
+      if (this.dryRunHeldAttemptId) {
+        const held = this.store.getAttempt(this.dryRunHeldAttemptId);
+        if (held?.state === ATTEMPT_STATES.DRY_RUN) {
+          this.log("queue_blocked_dry_run", {
+            attemptId: held.attemptId,
+            reason: "dry_run_checkout_ready",
+          });
+          return {
+            processed,
+            blocked: true,
+            attemptId: held.attemptId,
+            reason: "dry_run_checkout_ready",
+          };
+        }
+        this.dryRunHeldAttemptId = null;
+      }
       if (this.store.storageStatus?.().state === "degraded") {
         return { processed, blocked: true, reason: "storage_degraded" };
       }
@@ -302,6 +351,18 @@ export class PurchaseQueue {
       // Keep the visible browser on the page that needs attention. Navigating
       // to another listing could destroy a verification flow or obscure an
       // ambiguous payment that must be reconciled before any further work.
+      if (result.result === "dry_run") {
+        this.log("queue_blocked_dry_run", {
+          attemptId: result.attempt.attemptId,
+          reason: result.reason ?? "dry_run_checkout_ready",
+        });
+        return {
+          processed,
+          blocked: true,
+          attemptId: result.attempt.attemptId,
+          reason: result.reason ?? "dry_run_checkout_ready",
+        };
+      }
       if (result.result === "needs_user_action" || result.result === "unknown") {
         return {
           processed,
@@ -352,6 +413,24 @@ export class PurchaseQueue {
       if (checkoutOpened.needsUserAction) return this.#pausePreSubmit(attempt, checkoutOpened);
       attempt = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.CHECKOUT_OPENED);
 
+      // Discovery can remove a search while checkout is opening. Keep the
+      // same scope guard before the dry-run hold as before any payment action.
+      if (!this.#isCurrentSearch(attempt.searchId)) {
+        return this.#failOutOfScopeAttempt(attempt);
+      }
+
+      // Dry-run is a browser preview: once the exact checkout page is open,
+      // leave it visible and stop the serial worker before reading payment
+      // details or touching any later listing.
+      if (attempt.mode === EXECUTION_MODES.DRY_RUN) {
+        attempt = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.DRY_RUN, {
+          reason: "dry_run_no_payment_submitted",
+        });
+        this.store.markReservation(attempt.attemptId, RESERVATION_STATES.RELEASED);
+        this.dryRunHeldAttemptId = attempt.attemptId;
+        return { attempt, result: "dry_run", reason: "dry_run_checkout_ready" };
+      }
+
       const checkout = resultObject(
         await this.executor.readCheckout(attempt, { ...context, listing, checkoutOpened }),
         "readCheckout",
@@ -376,13 +455,6 @@ export class PurchaseQueue {
         return this.#failOutOfScopeAttempt(attempt);
       }
 
-      if (attempt.mode === EXECUTION_MODES.DRY_RUN) {
-        attempt = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.DRY_RUN, {
-          reason: "dry_run_no_payment_submitted",
-        });
-        this.store.markReservation(attempt.attemptId, RESERVATION_STATES.RELEASED);
-        return { attempt, result: "dry_run" };
-      }
       if (attempt.mode === EXECUTION_MODES.HUMAN_FINAL) {
         attempt = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.NEEDS_USER_ACTION, {
           reason: "human_final_required",
@@ -418,20 +490,20 @@ export class PurchaseQueue {
       }
       if (payment.outcome === PAYMENT_OUTCOMES.FAILED_BEFORE_SUBMIT) {
         attempt = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.FAILED, {
-          reason: payment.reason ?? "payment_failed_before_submit",
+          reason: resultReason(payment.reason, "payment_failed_before_submit"),
         });
         this.store.markReservation(attempt.attemptId, RESERVATION_STATES.RELEASED);
         return { attempt, result: "failed" };
       }
       if (payment.outcome === PAYMENT_OUTCOMES.NEEDS_USER_ACTION) {
         attempt = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.NEEDS_USER_ACTION, {
-          reason: payment.reason ?? "payment_verification_required",
+          reason: resultReason(payment.reason, "payment_verification_required"),
         });
         this.store.markReservation(attempt.attemptId, RESERVATION_STATES.HELD);
         return { attempt, result: "needs_user_action" };
       }
       if (payment.outcome !== PAYMENT_OUTCOMES.SUBMITTED) {
-        return this.#markUnknown(attempt, payment.reason ?? "payment_outcome_unknown", payment);
+        return this.#markUnknown(attempt, resultReason(payment.reason, "payment_outcome_unknown"), payment);
       }
       attempt = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.CONFIRMING, {
         orderId: payment.orderId ?? null,
@@ -464,7 +536,9 @@ export class PurchaseQueue {
       throw new Error("Attempt search is no longer in the current account scope");
     }
     if (payment?.outcome === PAYMENT_OUTCOMES.FAILED_BEFORE_SUBMIT) {
-      attempt = this.store.transitionAttempt(attemptId, ATTEMPT_STATES.FAILED, { reason: payment.reason ?? "human_payment_failed" });
+      attempt = this.store.transitionAttempt(attemptId, ATTEMPT_STATES.FAILED, {
+        reason: resultReason(payment.reason, "human_payment_failed"),
+      });
       this.store.markReservation(attemptId, RESERVATION_STATES.RELEASED);
       return { attempt, result: "failed" };
     }
@@ -517,7 +591,7 @@ export class PurchaseQueue {
     }
     if (outcome.outcome === RECONCILE_OUTCOMES.SUCCEEDED) {
       const succeeded = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.SUCCEEDED, {
-        reason: outcome.reason ?? "order_confirmed",
+        reason: resultReason(outcome.reason, "order_confirmed"),
         orderId: outcome.orderId ?? attempt.orderId,
       });
       this.store.markReservation(attempt.attemptId, RESERVATION_STATES.COMMITTED);
@@ -525,14 +599,14 @@ export class PurchaseQueue {
     }
     if (outcome.outcome === RECONCILE_OUTCOMES.FAILED) {
       const failed = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.FAILED, {
-        reason: outcome.reason ?? "order_failed",
+        reason: resultReason(outcome.reason, "order_failed"),
       });
       this.store.markReservation(attempt.attemptId, RESERVATION_STATES.RELEASED);
       return { attempt: failed, result: "failed" };
     }
     if (outcome.outcome === RECONCILE_OUTCOMES.NEEDS_USER_ACTION) {
       const waiting = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.NEEDS_USER_ACTION, {
-        reason: outcome.reason ?? "order_needs_user_action",
+        reason: resultReason(outcome.reason, "order_needs_user_action"),
       });
       this.store.markReservation(attempt.attemptId, RESERVATION_STATES.HELD);
       return { attempt: waiting, result: "needs_user_action" };
@@ -541,8 +615,10 @@ export class PurchaseQueue {
   }
 
   #pausePreSubmit(attempt, browserResult) {
-    const rawReason = String(browserResult?.reason ?? browserResult?.status ?? "verification_required")
-      .replace(/^pre_submit_/, "");
+    const rawReason = resultReason(
+      browserResult?.reason,
+      resultReason(browserResult?.status, "verification_required"),
+    ).replace(/^pre_submit_/, "");
     const waiting = this.store.transitionAttempt(attempt.attemptId, ATTEMPT_STATES.NEEDS_USER_ACTION, {
       reason: `pre_submit_${rawReason}`,
     });
@@ -556,12 +632,13 @@ export class PurchaseQueue {
   #markUnknown(attempt, reason, metadata = null) {
     const current = this.store.getAttempt(attempt.attemptId);
     if (current.state === ATTEMPT_STATES.UNKNOWN) return { attempt: current, result: "unknown" };
+    const safeReason = resultReason(reason, "payment_outcome_unknown");
     const unknown = this.store.transitionAttempt(current.attemptId, ATTEMPT_STATES.UNKNOWN, {
-      reason,
-      metadata,
+      reason: safeReason,
+      metadata: safeMetadata(metadata),
     });
     this.store.markReservation(current.attemptId, RESERVATION_STATES.HELD);
-    this.log("attempt_unknown", { attemptId: current.attemptId, reason });
+    this.log("attempt_unknown", { attemptId: current.attemptId, reason: safeReason });
     return { attempt: unknown, result: "unknown" };
   }
 

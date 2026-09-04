@@ -18,6 +18,30 @@ const freezeTree = (value) => {
   return value;
 };
 
+// Playwright's semantic locator APIs are more stable than generated classes
+// and test IDs.  These small descriptors keep that choice declarative while
+// allowing the DOM adapter to provide CSS fallbacks to lightweight fixtures.
+const role = (name, options = {}) => ({
+  kind: "role",
+  role: name,
+  options,
+});
+
+const text = (value, options = {}) => ({
+  kind: "text",
+  value,
+  options,
+});
+
+const MONEY_TEXT = /^[£€$]\s*\d+(?:,\d{3})*(?:\.\d{1,2})?$/;
+
+const withinHeading = (name, options = {}) => ({
+  kind: "within-heading",
+  heading: name,
+  options,
+  pattern: MONEY_TEXT,
+});
+
 /**
  * Stable attributes are preferred.  The text/semantic fallbacks are kept
  * narrow on purpose: an unrecognised page must be treated as unknown rather
@@ -27,6 +51,7 @@ export const VINTED_SELECTORS = freezeTree({
   page: {
     body: ["body"],
     login: [
+      role("link", { name: "Sign up | Log in", exact: true }),
       '[data-testid="login-page"]',
       '[data-testid="login-form"]',
       'form[action*="/login"]',
@@ -60,6 +85,11 @@ export const VINTED_SELECTORS = freezeTree({
       '[data-testid="item-page"]',
       '[data-testid="listing-page"]',
       '[data-item-id]',
+      'main',
+    ],
+    title: [
+      role("heading", { level: 1 }),
+      'h1',
     ],
     id: [
       '[data-testid="item-id"]',
@@ -72,11 +102,14 @@ export const VINTED_SELECTORS = freezeTree({
       '[data-testid="item-status"]',
       '[data-testid="item-sold"]',
       '[data-available]',
+      text("Removed!", { exact: true }),
     ],
     price: [
       '[data-testid="item-price"]',
+      '[data-testid="item-details__price"]',
       '[data-testid="listing-price"]',
       '[itemprop="price"]',
+      text(MONEY_TEXT),
     ],
     currency: [
       '[data-testid="item-currency"]',
@@ -84,10 +117,13 @@ export const VINTED_SELECTORS = freezeTree({
       '[itemprop="priceCurrency"]',
     ],
     buyButton: [
+      role("button", { name: "Buy now", exact: true }),
       '[data-testid="buy-button"]',
       '[data-testid="buy-now"]',
+      '[data-testid="item-buy-button"]',
       'button[name="Buy now"]',
       'button[aria-label="Buy now"]',
+      'button:text-is("Buy now")',
     ],
   },
   checkout: {
@@ -95,7 +131,14 @@ export const VINTED_SELECTORS = freezeTree({
       '[data-testid="checkout-page"]',
       '[data-testid="purchase-checkout"]',
     ],
+    totalHeading: [
+      role("heading", { name: "Total to pay", exact: true }),
+      'h1:text-is("Total to pay")',
+      'h2:text-is("Total to pay")',
+      'h3:text-is("Total to pay")',
+    ],
     total: [
+      withinHeading("Total to pay", { exact: true }),
       '[data-testid="checkout-total"]',
       '[data-testid="order-total"]',
       '[data-testid="purchase-total"]',
@@ -107,15 +150,21 @@ export const VINTED_SELECTORS = freezeTree({
       '[itemprop="priceCurrency"]',
     ],
     paymentMethod: [
+      text("Bank card Use a credit or debit card", { exact: true }),
+      role("radio", { name: "Bank card Use a credit or debit card", exact: true }),
       '[data-testid="selected-payment-method"]',
       '[data-testid="saved-payment-method"]',
       '[data-testid="payment-method"]',
     ],
+    setupRequired: [
+      text("Add your address", { exact: true }),
+      role("button", { name: "Add your address", exact: true }),
+      role("link", { name: "Add your address", exact: true }),
+    ],
     submitButton: [
+      role("button", { name: "Pay", exact: true }),
       '[data-testid="submit-payment"]',
-      '[data-testid="place-order"]',
-      'button[name="Pay now"]',
-      'button[name="Place order"]',
+      'button:text-is("Pay")',
     ],
   },
   reconciliation: {
@@ -170,6 +219,20 @@ export function isAllowedListingUrl(value, itemId) {
     itemId.length > 0 &&
     extractListingId(value) === itemId
   );
+}
+
+/**
+ * Checkout is a separate positive navigation boundary.  Same-origin pages
+ * are not enough evidence after clicking Buy now; only Vinted's exact
+ * `/checkout` path (with any query string) qualifies.
+ */
+export function isAllowedCheckoutUrl(value) {
+  try {
+    const url = new URL(value);
+    return isAllowedVintedUrl(value) && url.pathname === "/checkout";
+  } catch {
+    return false;
+  }
 }
 
 export function normalizeCurrency(value) {

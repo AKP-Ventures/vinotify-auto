@@ -120,7 +120,10 @@ applies them to the running policy immediately, and always disarms the agent.
 
 The public release supports only two execution modes:
 
-- `dry_run`: discover and evaluate matching events without making purchases.
+- `dry_run`: verify one matching listing, open Vinted's exact checkout page,
+  and leave it visible without reading checkout/payment details or submitting
+  payment. The serial queue remains parked on that checkout until the operator
+  explicitly changes mode or restarts the app.
 - `human_final`: prepare the visible checkout and require the user to perform
   the final payment action.
 
@@ -132,16 +135,26 @@ a development build exposes the option.
 ## Requirements
 
 - Node.js 22 or newer.
-- A desktop installation of Google Chrome/Chromium that the user can see and
-  interact with. The agent does not bundle a browser.
+- A desktop Chromium-family browser that Playwright can launch and the user
+  can see and interact with. This Mac uses Arc; Google Chrome/Chromium is also
+  supported. The agent does not bundle a browser.
 - `playwright-core@1.55.0` (installed by `npm ci`). It supplies the driver;
   the installed system browser supplies the executable.
 - A dedicated absolute user-data directory. Do not point it at a normal
-  personal Chrome profile or share it with another automation process.
+  personal Arc/Chrome profile or share it with another automation process.
 
-Supported target is desktop macOS, Windows, or Linux with a visible Chrome or
-Chromium window. Mobile browsers, iOS, Android, Safari, Firefox, headless
-operation, and remote/cloud browser execution are unsupported.
+Supported target is desktop macOS, Windows, or Linux with a visible compatible
+Chromium-family window. The example config selects Arc on macOS; change only
+`browser.executablePath` to select Chrome/Chromium elsewhere. Mobile browsers,
+iOS, Android, Safari, Firefox, headless operation, and remote/cloud browser
+execution are unsupported.
+
+Arc on macOS is single-instance. Fully quit the normal Arc application before
+starting Vinotify Auto; the app then opens Arc with its isolated
+`browser.userDataDir`. Sign in to Vinted once in that dedicated window and the
+session remains in that profile for later runs. The controller refuses Arc's
+personal profile path and times out with an actionable error if normal Arc is
+still running.
 
 See [`config.example.json`](config.example.json). The user signs in to Vinted
 manually in the visible dedicated window. Authentication cookies and the
@@ -202,7 +215,10 @@ only IDs in the required `purchase.searchAllowlist` may enter the purchase
 queue. At most eight long polls run at once by default
 (`vinotify.maxConcurrentFeeds`); the public configuration permits at most 12.
 Admission is fair and removed searches are aborted. One serial queue owns the
-visible browser. Feed events,
+visible browser. A newly seen feed first advances through the retained event
+snapshot without persisting or queueing those historical items; this warm-start
+cursor is durable across restarts and the feed becomes actionable only after it
+reaches an empty, non-continuing page. Feed events,
 deduplication keys, attempts, state transitions, budget reservations, and
 cursors are persisted atomically in a local SQLite database. A crash before
 payment can safely requeue work; a crash at or after the payment boundary
