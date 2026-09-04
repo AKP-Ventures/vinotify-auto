@@ -1,0 +1,37 @@
+{
+  "vinotify": {
+    "baseUrl": "https://vinotify.me",
+    "longPollSeconds": 25,
+    "maxConcurrentFeeds": 8,
+    "discoveryRefreshSeconds": 60
+  },
+  "browser": {
+    "userDataDir": "profile",
+    "executablePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  },
+  "storage": {
+    "databasePath": "data/agent.sqlite3",
+    "attemptRetentionDays": 30,
+    "logRetentionDays": 14,
+    "maxLogRows": 10000,
+    "maxDatabaseBytes": 536870912,
+    "cleanupBatchSize": 250,
+    "cleanupIntervalSeconds": 300
+  },
+  "ui": {
+    "port": 43121
+  },
+  "purchase": {
+    "mode": "dry_run",
+    "enableAutoSubmit": false,
+    "marketAllowlist": ["UK"],
+    "currencyAllowlist": ["GBP"],
+    "searchAllowlist": [12345],
+    "maxEventAgeSeconds": 120,
+    "maxItemPriceMinor": 2500,
+    "maxCheckoutTotalMinor": 4000,
+    "maxDailySpendMinor": 10000,
+    "maxDailyCount": 1,
+    "armDurationSeconds": 900
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "vinotify-auto",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Unofficial, user-operated local purchasing companion for Vinotify read-only feeds",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/AKP-Ventures/vinotify-auto.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "check": "node --check src/main.js && node --check src/app.js && node --check src/runtime.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright-core": "1.55.0"
+  }
+}
